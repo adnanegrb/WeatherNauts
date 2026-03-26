@@ -27,47 +27,43 @@ numeric_cols = [
 
 def clean_year(year):
 
-    # Chargement
     df = pd.read_csv(f"weather_{year}.csv")
-
-    # On garde seulement les 20 villes du concours
     df = df[df['city_name'].isin(cities_20)]
-
-    # Parser le timestamp → extraire heure et mois
+    
     df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
     df = df.sort_values(['city_name', 'timestamp'])
     df['hour']  = df['timestamp'].dt.hour
     df['month'] = df['timestamp'].dt.month
-
-    # Supprimer les éventuels doublons
+    
     df = df.drop_duplicates(subset=['city_name', 'timestamp'])
-
-    # Alerte si une ville manque dans le CSV
+    
     missing = set(cities_20) - set(df['city_name'].unique())
     if missing:
         print(f"{year} — villes manquantes : {missing}")
-
-    # Clip physique — on corrige les valeurs impossibles
+    
     for col, (lower, upper) in PHYSICAL_LIMITS.items():
         if col in df.columns:
             df[col] = df[col].clip(lower, upper)
-
-    # Remplir les NaN par ville : 
-        # interpolate → milieu | ffill → fin | bfill → début
+    
+    # Étape 1 : interpolation + ffill + bfill par ville
     df[numeric_cols] = (
         df.groupby('city_name')[numeric_cols]
         .transform(lambda x: x.interpolate(method='linear')
                                .ffill()
                                .bfill())
     )
-
-    # Vérifications finales — filet de sécurité
+    
+    # Étape 2 : si NaN restants → médiane globale par colonne
+    for col in numeric_cols:
+        if df[col].isnull().any():
+            median_val = df[col].median()
+            df[col] = df[col].fillna(median_val)
+    
+    # Vérifications finales
     assert df['city_name'].nunique() == 20, "Il manque des villes !"
     assert df.isnull().sum().sum() == 0,    "Il reste des NaN !"
-
-    # Sauvegarde
+    
     df.to_csv(f"weather_{year}_clean.csv", index=False)
 
-# Lancer sur toutes les années
 for year in range(2020, 2026):
     clean_year(year)
