@@ -3,16 +3,15 @@ import numpy as np
 
 # Records météo européens — limites physiques réelles
 PHYSICAL_LIMITS = {
-    'temperature':    (-30, 45),    
-    'wind_speed':     (0,   60),    
-    'rain':           (0,   50),    
-    'humidity':       (0,   100),   
-    'clouds':         (0,   100),   
-    'visibility':     (0,   20000), 
-    'snow':           (0,   30),    
-    'wind_direction': (0,   360),   
+    'temperature':    (-45,  50),    # Record Europe : -41°C (Mouthe) / +48.8°C (Sicile 2021)
+    'wind_speed':     (0,    75),    # Record lowland : 63.3 m/s (Fraserburgh 1989)
+    'rain':           (0,    200),   # Record Europe : 184.6 mm/h (Valencia 2024)
+    'humidity':       (0,    100),   # Limite physique pure
+    'clouds':         (0,    100),   # Limite physique pure
+    'visibility':     (0,    10000), # Convention METAR (cap à 9999m)
+    'snow':           (0,    40),    # Record Europe : ~25 mm/h (Capracotta 2015)
+    'wind_direction': (0,    360),   # Limite géométrique pure
 }
-
 cities_20 = [
     "Amsterdam", "Barcelona", "Birmingham", "Brussels",
     "Copenhagen", "Dortmund", "Dublin", "Düsseldorf",
