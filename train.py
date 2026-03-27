@@ -6,92 +6,68 @@ from xgboost import XGBRegressor, XGBClassifier
 from sklearn.model_selection import GridSearchCV
 import joblib
 
-# ─────────────────────────────────────────
-# FEATURES — toutes les colonnes créées
-# dans features.py
-# ─────────────────────────────────────────
-
 feature_cols = [
-    # Features de base Paris
     'temperature', 'humidity', 'wind_u', 'wind_v',
-
-    # Encodage cyclique heure et mois
     'sin_hour', 'cos_hour', 'sin_month', 'cos_month',
-
-    # Lags Paris température
     'paris_temperature_lag1', 'paris_temperature_lag3',
     'paris_temperature_lag6', 'paris_temperature_lag12',
-
-    # Lags Paris pluie
     'paris_rain_lag1', 'paris_rain_lag3',
     'paris_rain_lag6', 'paris_rain_lag12',
-
-    # Lags Paris vent
     'paris_wind_speed_lag1', 'paris_wind_speed_lag6',
-
-    # Deltas température
     'delta_temperature_1h', 'delta_temperature_6h',
-
-    # Deltas pluie
     'delta_rain_1h', 'delta_rain_6h',
-
-    # Deltas humidité
     'delta_humidity_1h', 'delta_humidity_6h',
-
-    # Upwind cities
     'upwind_temp', 'upwind_rain', 'upwind_wind',
-
-    # Dew point depression
     'dew_depression'
 ]
 
-# Std donnés par le concours
 STD_TEMP = 7.49
 STD_WIND = 5.05
 STD_RAIN = 0.40
 
 # ─────────────────────────────────────────
-# 1. CHARGER TOUTES LES ANNÉES 2020-2026
+# 1. CHARGEMENT
 # ─────────────────────────────────────────
+print("⏳ Chargement des données...")
 
 dfs = []
 for year in range(2020, 2027):
     try:
         df_year = pd.read_csv(f"weather_{year}_features.csv")
         dfs.append(df_year)
-        print(f"✅ {year} chargé — {len(df_year)} lignes")
+        print(f"   ✅ {year} — {len(df_year)} lignes")
     except FileNotFoundError:
-        print(f"⚠️ weather_{year}_features.csv non trouvé")
+        print(f"   ⚠️ {year} non trouvé")
 
 df = pd.concat(dfs, ignore_index=True)
 df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+print(f"✅ Total chargé — {len(df)} lignes\n")
 
-# Garder seulement Paris
+# ─────────────────────────────────────────
+# 2. PRÉPARATION PARIS
+# ─────────────────────────────────────────
+print("⏳ Préparation des données Paris...")
+
 paris = df[df['city_name'] == 'Paris'].copy()
 paris = paris.sort_values('timestamp').reset_index(drop=True)
+print(f"   Paris brut — {len(paris)} lignes")
 
-# ─────────────────────────────────────────
-# 2. TARGETS T+6H
-# ─────────────────────────────────────────
-
-# shift(-6) = valeur 6 heures dans le futur
 paris['target_temp'] = paris['temperature'].shift(-6)
 paris['target_wind'] = paris['wind_speed'].shift(-6)
 paris['target_rain'] = paris['rain'].shift(-6)
 
-# Supprimer lignes sans target ou sans features
 paris = paris.dropna(subset=['target_temp', 'target_wind', 'target_rain'])
 paris = paris.dropna(subset=feature_cols)
+print(f"   Paris après dropna — {len(paris)} lignes")
+print(f"   Features disponibles — {len(feature_cols)} colonnes\n")
 
 # ─────────────────────────────────────────
-# 3. SPLIT TRAIN / TEST
+# 3. SPLIT
 # ─────────────────────────────────────────
+print("⏳ Split Train / Test...")
 
-# Train : 2020-2024
 train = paris[paris['timestamp'].dt.year <= 2024]
-
-# Test : 2025 + 2026 (3 mois disponibles)
-test = paris[paris['timestamp'].dt.year >= 2025]
+test  = paris[paris['timestamp'].dt.year >= 2025]
 
 X_train = train[feature_cols]
 X_test  = test[feature_cols]
@@ -104,24 +80,26 @@ y_test_temp  = test['target_temp']
 y_test_wind  = test['target_wind']
 y_test_rain  = test['target_rain']
 
-print(f"\nTrain : {len(train)} lignes (2020-2024)")
-print(f"Test  : {len(test)} lignes (2025-2026)")
+print(f"   ✅ Train — {len(train)} lignes (2020-2024)")
+print(f"   ✅ Test  — {len(test)} lignes (2025-2026)\n")
 
 # ─────────────────────────────────────────
-# 4. SCALING → Ridge seulement
+# 4. SCALING
 # ─────────────────────────────────────────
+print("⏳ Scaling StandardScaler...")
 
-# Fit sur train seulement → jamais sur test
 scaler         = StandardScaler()
 X_train_scaled = scaler.fit_transform(X_train)
 X_test_scaled  = scaler.transform(X_test)
 
 joblib.dump(scaler, 'scaler.pkl')
-print("\nscaler.pkl sauvegardé ✅")
+print("   ✅ scaler.pkl sauvegardé\n")
 
 # ─────────────────────────────────────────
-# 5. MODÈLE TEMPÉRATURE → Ridge + GridSearch
+# 5. MODÈLE TEMPÉRATURE
 # ─────────────────────────────────────────
+print("⏳ Entraînement Ridge (température)...")
+print("   GridSearch en cours — patience ⏳")
 
 ridge_params = {'alpha': [0.1, 1.0, 10.0, 100.0]}
 ridge_gs     = GridSearchCV(
@@ -129,21 +107,22 @@ ridge_gs     = GridSearchCV(
     ridge_params,
     cv=5,
     scoring='neg_mean_absolute_error',
-    n_jobs=-1
+    n_jobs=-1,
+    verbose=1
 )
 ridge_gs.fit(X_train_scaled, y_train_temp)
 model_temp = ridge_gs.best_estimator_
 
-print(f"Ridge best alpha : {ridge_gs.best_params_}")
-
+print(f"   ✅ Meilleur alpha : {ridge_gs.best_params_}")
 joblib.dump(model_temp, 'model_temp.pkl')
-print("model_temp.pkl sauvegardé ✅")
+print("   ✅ model_temp.pkl sauvegardé\n")
 
 # ─────────────────────────────────────────
-# 6. MODÈLE VENT → XGBoost + GridSearch
+# 6. MODÈLE VENT
 # ─────────────────────────────────────────
+print("⏳ Entraînement XGBoost (vent)...")
+print("   GridSearch en cours — patience ⏳")
 
-# XGBoost → pas besoin de scaling
 xgb_params_wind = {
     'n_estimators' : [100, 200, 300],
     'max_depth'    : [3, 5, 7],
@@ -155,24 +134,25 @@ xgb_gs_wind = GridSearchCV(
     xgb_params_wind,
     cv=5,
     scoring='neg_mean_absolute_error',
-    n_jobs=-1
+    n_jobs=-1,
+    verbose=1
 )
 xgb_gs_wind.fit(X_train, y_train_wind)
 model_wind = xgb_gs_wind.best_estimator_
 
-print(f"XGBoost vent best params : {xgb_gs_wind.best_params_}")
-
+print(f"   ✅ Meilleurs params : {xgb_gs_wind.best_params_}")
 joblib.dump(model_wind, 'model_wind.pkl')
-print("model_wind.pkl sauvegardé ✅")
+print("   ✅ model_wind.pkl sauvegardé\n")
 
 # ─────────────────────────────────────────
-# 7. MODÈLE PLUIE → Classifieur + Régresseur
+# 7. MODÈLE PLUIE
 # ─────────────────────────────────────────
+print("⏳ Entraînement XGBoost Classifieur (pluie)...")
+print("   GridSearch en cours — patience ⏳")
 
-# Seuil 0.1mm → il pleut (1) ou pas (0)
 y_train_rain_clf = (y_train_rain > 0.1).astype(int)
+print(f"   Heures avec pluie : {y_train_rain_clf.sum()} / {len(y_train_rain_clf)}")
 
-# GridSearch classifieur
 xgb_params_clf = {
     'n_estimators' : [100, 200, 300],
     'max_depth'    : [3, 4, 5],
@@ -183,19 +163,20 @@ xgb_gs_clf = GridSearchCV(
     xgb_params_clf,
     cv=5,
     scoring='neg_log_loss',
-    n_jobs=-1
+    n_jobs=-1,
+    verbose=1
 )
 xgb_gs_clf.fit(X_train, y_train_rain_clf)
 model_rain_clf = xgb_gs_clf.best_estimator_
 
-print(f"XGBoost pluie clf best params : {xgb_gs_clf.best_params_}")
-
+print(f"   ✅ Meilleurs params clf : {xgb_gs_clf.best_params_}")
 joblib.dump(model_rain_clf, 'model_rain_clf.pkl')
-print("model_rain_clf.pkl sauvegardé ✅")
+print("   ✅ model_rain_clf.pkl sauvegardé\n")
 
-# GridSearch régresseur pluie
-# Entraîné seulement sur les heures où il pleut
+print("⏳ Entraînement XGBoost Régresseur (pluie)...")
+
 rain_mask = y_train_rain > 0.1
+print(f"   Lignes avec pluie pour régresseur : {rain_mask.sum()}")
 
 xgb_params_reg = {
     'n_estimators' : [100, 200, 300],
@@ -207,29 +188,29 @@ xgb_gs_reg = GridSearchCV(
     xgb_params_reg,
     cv=5,
     scoring='neg_mean_absolute_error',
-    n_jobs=-1
+    n_jobs=-1,
+    verbose=1
 )
 xgb_gs_reg.fit(X_train[rain_mask], y_train_rain[rain_mask])
 model_rain_reg = xgb_gs_reg.best_estimator_
 
-print(f"XGBoost pluie reg best params : {xgb_gs_reg.best_params_}")
-
+print(f"   ✅ Meilleurs params reg : {xgb_gs_reg.best_params_}")
 joblib.dump(model_rain_reg, 'model_rain_reg.pkl')
-print("model_rain_reg.pkl sauvegardé ✅")
+print("   ✅ model_rain_reg.pkl sauvegardé\n")
 
 # ─────────────────────────────────────────
-# 8. ÉVALUATION SUR TEST
+# 8. ÉVALUATION
 # ─────────────────────────────────────────
+print("⏳ Évaluation sur test...")
 
-# Prédictions température
-pred_temp = model_temp.predict(X_test_scaled)
-mae_temp  = np.mean(np.abs(pred_temp - y_test_temp))
+pred_temp  = model_temp.predict(X_test_scaled)
+mae_temp   = np.mean(np.abs(pred_temp - y_test_temp))
+print(f"   ✅ Température prédite")
 
-# Prédictions vent
-pred_wind = model_wind.predict(X_test)
-mae_wind  = np.mean(np.abs(pred_wind - y_test_wind))
+pred_wind  = model_wind.predict(X_test)
+mae_wind   = np.mean(np.abs(pred_wind - y_test_wind))
+print(f"   ✅ Vent prédit")
 
-# Prédictions pluie
 rain_proba = model_rain_clf.predict_proba(X_test)[:, 1]
 pred_rain  = np.where(
     rain_proba > 0.5,
@@ -237,30 +218,28 @@ pred_rain  = np.where(
     0.0
 )
 mae_rain = np.mean(np.abs(pred_rain - y_test_rain))
+print(f"   ✅ Pluie prédite\n")
 
 # ─────────────────────────────────────────
-# 9. RÉSULTATS DÉTAILLÉS
+# 9. RÉSULTATS FINAUX
 # ─────────────────────────────────────────
 
-print(f"\n{'='*40}")
-print(f"RÉSULTATS SUR TEST (2025 + 2026)")
-print(f"{'='*40}")
-print(f"MAE température  : {mae_temp:.2f}°C  (std={STD_TEMP})")
-print(f"MAE vent         : {mae_wind:.2f} m/s (std={STD_WIND})")
-print(f"MAE pluie        : {mae_rain:.2f} mm  (std={STD_RAIN})")
-
-# Score normalisé comme le concours
 score_final = -np.mean([
     mae_temp / STD_TEMP,
     mae_wind / STD_WIND,
     mae_rain / STD_RAIN
 ])
 
+print(f"{'='*40}")
+print(f"RÉSULTATS FINAUX")
+print(f"{'='*40}")
+print(f"MAE température  : {mae_temp:.2f}°C")
+print(f"MAE vent         : {mae_wind:.2f} m/s")
+print(f"MAE pluie        : {mae_rain:.2f} mm")
 print(f"\nScore final  : {score_final:.4f}")
 print(f"Baseline     : -0.3000")
 print(f"{'='*40}")
 
-# Détail par année
 print(f"\nDÉTAIL PAR ANNÉE :")
 print(f"{'='*40}")
 for year in [2025, 2026]:
@@ -272,3 +251,5 @@ for year in [2025, 2026]:
     mae_r = np.mean(np.abs(pred_rain[mask.values] - y_test_rain[mask]))
     s     = -np.mean([mae_t/STD_TEMP, mae_w/STD_WIND, mae_r/STD_RAIN])
     print(f"{year} → temp:{mae_t:.2f}°C | vent:{mae_w:.2f}m/s | pluie:{mae_r:.2f}mm | score:{s:.4f}")
+
+print(f"\n🏆 Tous les modèles sauvegardés et prêts pour agent.py !")
