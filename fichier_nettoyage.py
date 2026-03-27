@@ -86,5 +86,5 @@ def clean_year(year):
     print(f"{year} — shape : {df.shape}")
 
 # Lancer le nettoyage sur toutes les années
-for year in range(2020, 2026):
+for year in range(2020, 2027):
     clean_year(year)
