@@ -6,19 +6,42 @@ from xgboost import XGBRegressor, XGBClassifier
 from sklearn.model_selection import GridSearchCV
 import joblib
 
-# Features utilisées pour l'entraînement
+# ─────────────────────────────────────────
+# FEATURES — toutes les colonnes créées
+# dans features.py
+# ─────────────────────────────────────────
+
 feature_cols = [
+    # Features de base Paris
     'temperature', 'humidity', 'wind_u', 'wind_v',
+
+    # Encodage cyclique heure et mois
     'sin_hour', 'cos_hour', 'sin_month', 'cos_month',
+
+    # Lags Paris température
     'paris_temperature_lag1', 'paris_temperature_lag3',
     'paris_temperature_lag6', 'paris_temperature_lag12',
+
+    # Lags Paris pluie
     'paris_rain_lag1', 'paris_rain_lag3',
     'paris_rain_lag6', 'paris_rain_lag12',
+
+    # Lags Paris vent
     'paris_wind_speed_lag1', 'paris_wind_speed_lag6',
+
+    # Deltas température
     'delta_temperature_1h', 'delta_temperature_6h',
+
+    # Deltas pluie
     'delta_rain_1h', 'delta_rain_6h',
+
+    # Deltas humidité
     'delta_humidity_1h', 'delta_humidity_6h',
+
+    # Upwind cities
     'upwind_temp', 'upwind_rain', 'upwind_wind',
+
+    # Dew point depression
     'dew_depression'
 ]
 
@@ -48,7 +71,7 @@ paris = df[df['city_name'] == 'Paris'].copy()
 paris = paris.sort_values('timestamp').reset_index(drop=True)
 
 # ─────────────────────────────────────────
-# 2. CRÉER LES TARGETS T+6H
+# 2. TARGETS T+6H
 # ─────────────────────────────────────────
 
 # shift(-6) = valeur 6 heures dans le futur
@@ -56,7 +79,7 @@ paris['target_temp'] = paris['temperature'].shift(-6)
 paris['target_wind'] = paris['wind_speed'].shift(-6)
 paris['target_rain'] = paris['rain'].shift(-6)
 
-# Supprimer les lignes sans target ou sans features
+# Supprimer lignes sans target ou sans features
 paris = paris.dropna(subset=['target_temp', 'target_wind', 'target_rain'])
 paris = paris.dropna(subset=feature_cols)
 
@@ -97,16 +120,16 @@ joblib.dump(scaler, 'scaler.pkl')
 print("\nscaler.pkl sauvegardé ✅")
 
 # ─────────────────────────────────────────
-# 5. MODÈLE TEMPÉRATURE → Ridge
+# 5. MODÈLE TEMPÉRATURE → Ridge + GridSearch
 # ─────────────────────────────────────────
 
-# GridSearch pour trouver le meilleur alpha
 ridge_params = {'alpha': [0.1, 1.0, 10.0, 100.0]}
 ridge_gs     = GridSearchCV(
     Ridge(),
     ridge_params,
     cv=5,
-    scoring='neg_mean_absolute_error'
+    scoring='neg_mean_absolute_error',
+    n_jobs=-1
 )
 ridge_gs.fit(X_train_scaled, y_train_temp)
 model_temp = ridge_gs.best_estimator_
@@ -117,18 +140,27 @@ joblib.dump(model_temp, 'model_temp.pkl')
 print("model_temp.pkl sauvegardé ✅")
 
 # ─────────────────────────────────────────
-# 6. MODÈLE VENT → XGBoost Regressor
+# 6. MODÈLE VENT → XGBoost + GridSearch
 # ─────────────────────────────────────────
 
 # XGBoost → pas besoin de scaling
-model_wind = XGBRegressor(
-    n_estimators=200,
-    max_depth=5,
-    learning_rate=0.05,
-    subsample=0.8,
-    random_state=42
+xgb_params_wind = {
+    'n_estimators' : [100, 200, 300],
+    'max_depth'    : [3, 5, 7],
+    'learning_rate': [0.01, 0.05, 0.1],
+    'subsample'    : [0.8, 1.0]
+}
+xgb_gs_wind = GridSearchCV(
+    XGBRegressor(random_state=42),
+    xgb_params_wind,
+    cv=5,
+    scoring='neg_mean_absolute_error',
+    n_jobs=-1
 )
-model_wind.fit(X_train, y_train_wind)
+xgb_gs_wind.fit(X_train, y_train_wind)
+model_wind = xgb_gs_wind.best_estimator_
+
+print(f"XGBoost vent best params : {xgb_gs_wind.best_params_}")
 
 joblib.dump(model_wind, 'model_wind.pkl')
 print("model_wind.pkl sauvegardé ✅")
@@ -140,28 +172,47 @@ print("model_wind.pkl sauvegardé ✅")
 # Seuil 0.1mm → il pleut (1) ou pas (0)
 y_train_rain_clf = (y_train_rain > 0.1).astype(int)
 
-# Classifieur → va-t-il pleuvoir ?
-model_rain_clf = XGBClassifier(
-    n_estimators=200,
-    max_depth=4,
-    learning_rate=0.05,
-    random_state=42
+# GridSearch classifieur
+xgb_params_clf = {
+    'n_estimators' : [100, 200, 300],
+    'max_depth'    : [3, 4, 5],
+    'learning_rate': [0.01, 0.05, 0.1]
+}
+xgb_gs_clf = GridSearchCV(
+    XGBClassifier(random_state=42),
+    xgb_params_clf,
+    cv=5,
+    scoring='neg_log_loss',
+    n_jobs=-1
 )
-model_rain_clf.fit(X_train, y_train_rain_clf)
+xgb_gs_clf.fit(X_train, y_train_rain_clf)
+model_rain_clf = xgb_gs_clf.best_estimator_
+
+print(f"XGBoost pluie clf best params : {xgb_gs_clf.best_params_}")
 
 joblib.dump(model_rain_clf, 'model_rain_clf.pkl')
 print("model_rain_clf.pkl sauvegardé ✅")
 
-# Régresseur → combien de mm ?
+# GridSearch régresseur pluie
 # Entraîné seulement sur les heures où il pleut
-rain_mask      = y_train_rain > 0.1
-model_rain_reg = XGBRegressor(
-    n_estimators=200,
-    max_depth=4,
-    learning_rate=0.05,
-    random_state=42
+rain_mask = y_train_rain > 0.1
+
+xgb_params_reg = {
+    'n_estimators' : [100, 200, 300],
+    'max_depth'    : [3, 4, 5],
+    'learning_rate': [0.01, 0.05, 0.1]
+}
+xgb_gs_reg = GridSearchCV(
+    XGBRegressor(random_state=42),
+    xgb_params_reg,
+    cv=5,
+    scoring='neg_mean_absolute_error',
+    n_jobs=-1
 )
-model_rain_reg.fit(X_train[rain_mask], y_train_rain[rain_mask])
+xgb_gs_reg.fit(X_train[rain_mask], y_train_rain[rain_mask])
+model_rain_reg = xgb_gs_reg.best_estimator_
+
+print(f"XGBoost pluie reg best params : {xgb_gs_reg.best_params_}")
 
 joblib.dump(model_rain_reg, 'model_rain_reg.pkl')
 print("model_rain_reg.pkl sauvegardé ✅")
