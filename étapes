@@ -1,0 +1,21 @@
+-temperature (on privilegie: ridge et gradient boosting)       
+-vent est plus caotique il depent plus des villes voisine non lineaire(gradient boosting et randome forest)
+-pluie Binaire (gradient boosting classificator, gradient boosting régressions) 
+
+
+
+features:
+-poid dynamique selon le vent ( si le vent vient de l'est alors on regarde les villes de l'est) 
+-transformer date et heure en cos sin
+-lags temporels
+-stats fenetre
+-dew point depression 
+
+
+
+tasks:
+-Faire les testes pour former les graphes des différents models on aura 3 graphes (pluie, vent, temperature)
+il faut faire un code a executer localement boucle 50 testes
+-faire l'algorithme de ponderation d'utilisation des models on aura 3 ponderation defferentes (x,y,z) pour chaque model utilisé
+-
+-
