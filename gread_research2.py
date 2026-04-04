@@ -99,14 +99,17 @@ def build_dataset(df: pd.DataFrame) -> tuple:
 
     timestamps = pivot.index
     T = len(timestamps)
-    print(f"  {T:,} timesteps disponibles")
+    print(f"  {T:,} timesteps | periode : {timestamps[0]} -> {timestamps[-1]}")
+    print(f"  Villes detectees : {list(pivot['temperature'].columns)}")
+    print(f"  Construction fenêtres 24h -> T+{HORIZON}h...")
 
     X_list, y_list = [], []
     skipped = 0
+    total    = T - 23 - HORIZON
+    log_step = max(1, total // 10)
 
     for t in range(23, T - HORIZON):
         try:
-            # ── X : fenêtre 24h ────────────────────────────────────────────
             X = np.zeros((20, 24, 8), dtype=np.float32)
             for ci, city in enumerate(CITIES):
                 for fi, feat in enumerate(FEAT_COLS):
@@ -117,14 +120,12 @@ def build_dataset(df: pd.DataFrame) -> tuple:
                     except KeyError:
                         pass
 
-            # ── y : Paris à T+HORIZON ──────────────────────────────────────
             y = np.array([
-                float(pivot[("temperature",  "Paris")].iloc[t + HORIZON]),
-                float(pivot[("wind_speed",   "Paris")].iloc[t + HORIZON]),
-                float(pivot[("rain",         "Paris")].iloc[t + HORIZON]),
+                float(pivot[("temperature", "Paris")].iloc[t + HORIZON]),
+                float(pivot[("wind_speed",  "Paris")].iloc[t + HORIZON]),
+                float(pivot[("rain",        "Paris")].iloc[t + HORIZON]),
             ], dtype=np.float32)
 
-            # Filtre NaN
             if np.isnan(X).mean() > 0.05 or np.isnan(y).any():
                 skipped += 1
                 continue
@@ -135,17 +136,32 @@ def build_dataset(df: pd.DataFrame) -> tuple:
         except Exception:
             skipped += 1
 
-    print(f"  {len(X_list):,} samples valides | {skipped} ignorés")
-    return np.array(X_list, dtype=np.float32), np.array(y_list, dtype=np.float32)
+        done = t - 23
+        if done % log_step == 0:
+            pct = int(100 * done / total)
+            print(f"    {pct:3d}% — {len(X_list):,} samples ok | {skipped} ignores", end="\r")
+
+    print()
+    print(f"  OK {len(X_list):,} samples valides | {skipped} ignores")
+
+    y_arr = np.array(y_list, dtype=np.float32)
+    print(f"  Shape X : ({len(X_list)}, 20, 24, 8)")
+    print(f"  Shape y : ({len(y_list)}, 3)  [temp, wind, rain]")
+    print(f"  y_temp  : mean={y_arr[:,0].mean():.2f}C  std={y_arr[:,0].std():.2f}")
+    print(f"  y_wind  : mean={y_arr[:,1].mean():.2f}km/h  std={y_arr[:,1].std():.2f}")
+    print(f"  y_rain  : mean={y_arr[:,2].mean():.4f}mm  zeros={100*(y_arr[:,2]==0).mean():.1f}%")
+
+    return np.array(X_list, dtype=np.float32), y_arr
 
 
 # ── Feature Engineering ────────────────────────────────────────────────────────
 def build_features(X: np.ndarray) -> np.ndarray:
-    """X : (N, 20, 24, 8) → (N, D) float32"""
+    """X : (N, 20, 24, 8) -> (N, D) float32"""
     N     = X.shape[0]
     paris = X[:, PARIS]
     last  = paris[:, -1]
     f     = []
+    print(f"    calcul features sur {N:,} samples...")
 
     # Valeurs courantes
     f.append(last)
@@ -227,7 +243,9 @@ def build_features(X: np.ndarray) -> np.ndarray:
             f.append((num / den).reshape(-1, 1))
 
     out = np.hstack(f)
-    return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    print(f"    -> {out.shape[1]} features construites | NaN restants : {np.isnan(out).sum()}")
+    return out
 
 
 # ── Optuna ─────────────────────────────────────────────────────────────────────
@@ -282,12 +300,15 @@ def optimize(name: str, Ft, yt, Fv, yv, n_trials: int) -> tuple:
         return mae
 
     print(f"\n[Optuna] {name} — {n_trials} essais...")
+    print(f"  Train : {len(Ft):,} samples | Val : {len(Fv):,} samples")
+    print(f"  Target mean={yt.mean():.4f}  std={yt.std():.4f}  min={yt.min():.4f}  max={yt.max():.4f}")
     study = optuna.create_study(
         direction="minimize",
         sampler=optuna.samplers.TPESampler(seed=42),
     )
     study.optimize(objective, n_trials=n_trials)
-    print(f"  → Best MAE : {best_mae:.4f}")
+    print(f"\n  Best MAE    : {best_mae:.4f}")
+    print(f"  Best params : {study.best_params}")
     return study.best_params, history, best_mdl[0]
 
 
@@ -422,29 +443,38 @@ def main():
     print("  ÉTAPE 6 — Entraînement final + sauvegarde")
     print("="*55)
 
-    print("  → Température...")
+    print("  -> Temperature (LightGBM DART sur delta T)...")
+    print(f"     params : {bp_temp}")
     m_temp = lgb.LGBMRegressor(**bp_temp)
     m_temp.fit(F_train, dt_temp)
-    pickle.dump(m_temp, open(os.path.join(OUTPUT_DIR, "model_temp.pkl"), "wb"))
-    print("    ✓ model_temp.pkl")
+    path_temp = os.path.join(OUTPUT_DIR, "model_temp.pkl")
+    pickle.dump(m_temp, open(path_temp, "wb"))
+    print(f"     OK model_temp.pkl ({os.path.getsize(path_temp)/1024:.0f} KB)")
 
-    print("  → Vent...")
+    print("  -> Vent (LightGBM DART sur delta W)...")
+    print(f"     params : {bp_wind}")
     m_wind = lgb.LGBMRegressor(**bp_wind)
     m_wind.fit(F_train, dt_wind)
-    pickle.dump(m_wind, open(os.path.join(OUTPUT_DIR, "model_wind.pkl"), "wb"))
-    print("    ✓ model_wind.pkl")
+    path_wind = os.path.join(OUTPUT_DIR, "model_wind.pkl")
+    pickle.dump(m_wind, open(path_wind, "wb"))
+    print(f"     OK model_wind.pkl ({os.path.getsize(path_wind)/1024:.0f} KB)")
 
-    print("  → Pluie classifier...")
+    print("  -> Pluie classifier (LogisticRegression)...")
+    print(f"     Train sur {wet_tr.sum():,} samples positifs / {len(wet_tr):,} total")
     clf = LogisticRegression(C=1.0, max_iter=500)
     clf.fit(F_train, wet_tr.astype(int))
-    pickle.dump(clf, open(os.path.join(OUTPUT_DIR, "rain_clf.pkl"), "wb"))
-    print("    ✓ rain_clf.pkl")
+    path_clf = os.path.join(OUTPUT_DIR, "rain_clf.pkl")
+    pickle.dump(clf, open(path_clf, "wb"))
+    print(f"     OK rain_clf.pkl ({os.path.getsize(path_clf)/1024:.0f} KB)")
 
-    print("  → Pluie regressor...")
+    print("  -> Pluie regressor (LightGBM GOSS/Tweedie)...")
+    print(f"     params : {bp_rain}")
+    print(f"     Train sur {wet_tr.sum():,} samples pluvieux uniquement")
     m_rain = lgb.LGBMRegressor(**bp_rain)
     m_rain.fit(F_train[wet_tr], rain_tr[wet_tr])
-    pickle.dump(m_rain, open(os.path.join(OUTPUT_DIR, "model_rain.pkl"), "wb"))
-    print("    ✓ model_rain.pkl")
+    path_rain = os.path.join(OUTPUT_DIR, "model_rain.pkl")
+    pickle.dump(m_rain, open(path_rain, "wb"))
+    print(f"     OK model_rain.pkl ({os.path.getsize(path_rain)/1024:.0f} KB)")
 
     # 7. Évaluation finale
     print("\n" + "="*55)
