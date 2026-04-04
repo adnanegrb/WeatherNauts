@@ -1,344 +1,471 @@
-import os
-import sys
-import time
-import warnings
-import itertools
+"""
+train.py
+─────────────────────────────────────────────────────────────────
+Script d'entraînement offline complet :
+  1. Charge weather_2020.csv → weather_2025.csv (train) + weather_2026.csv (val)
+  2. Construit X_train, y_train, X_val, y_val
+  3. Optuna x 100 essais par variable (temp, wind, rain)
+  4. Réentraîne les modèles finaux avec les meilleurs params
+  5. Sauvegarde model_temp.pkl, model_wind.pkl, model_rain.pkl, rain_clf.pkl
+  6. Génère 3 graphes Seaborn
+
+Usage :
+  python train.py
+"""
+
+import os, pickle, warnings
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.model_selection import KFold
+import matplotlib.pyplot as plt
+import lightgbm as lgb
+import optuna
 from sklearn.metrics import mean_absolute_error
+from sklearn.linear_model import LogisticRegression
 
 warnings.filterwarnings("ignore")
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-DATA_DIR   = r"C:\Users\Massy\Documents\ProjetAi\Données\clean data"
-AGENT_DIR  = r"C:\Users\Massy\Documents\ProjetAi\Données\clean data"
-OUTPUT_TXT = r"C:\Users\Massy\Documents\ProjetAi\best_params_all.txt"
+# ── Config ─────────────────────────────────────────────────────────────────────
+DATA_DIR   = r"C:\Users\Massy\Documents\Optuna"
+OUTPUT_DIR = r"C:\Users\Massy\Documents\Optuna\models"
+HORIZON    = 6      # T+6h
+N_TRIALS   = 100    # essais Optuna par variable
 
-if AGENT_DIR not in sys.path:
-    sys.path.insert(0, AGENT_DIR)
+# ── Constants ──────────────────────────────────────────────────────────────────
+PARIS = 16
+F_TEMP, F_RAIN, F_WIND, F_WDIR, F_HUM, F_CLOUD, F_VIS, F_SNOW = range(8)
 
-CITIES_ORDER = [
-    "Amsterdam", "Athens", "Barcelona", "Belgrade", "Berlin",
-    "Brussels", "Bucharest", "Budapest", "Copenhagen", "Dublin",
-    "Hamburg", "Helsinki", "Kiev", "Lisbon", "London",
-    "Madrid", "Paris", "Prague", "Rome", "Vienna",
+CITIES = [
+    "Amsterdam", "Barcelona", "Birmingham", "Brussels", "Copenhagen",
+    "Dortmund", "Dublin", "Düsseldorf", "Essen", "Frankfurt am Main",
+    "Köln", "London", "Manchester", "Marseille", "Milan", "Munich",
+    "Paris", "Rotterdam", "Stuttgart", "Turin"
 ]
-PARIS_IDX  = 16
-N_FEATURES = 6
 
-feat_map = {
-    "temperature": 0, "rain": 1, "wind_speed": 2,
-    "wind_direction": 3, "humidity": 4, "clouds": 5,
-}
+FEAT_COLS = ["temperature", "rain", "wind_speed", "wind_direction",
+             "humidity", "clouds", "visibility", "snow"]
 
-DISTANCES_PARIS = [431, 830, 502, 264, 1027, 469, 781, 411, 440, 479,
-                   403, 344, 570, 661, 640, 685, 0, 373, 500, 580]
-_dist  = np.array(DISTANCES_PARIS, dtype=np.float32)
-_sigma = float(np.median(_dist[_dist > 0]))
-POIDS_GEO = (1.0 / (1.0 + _dist / _sigma)).astype(np.float32)
-VOISINS_TRIES = sorted(
-    [i for i in range(20) if i != PARIS_IDX],
-    key=lambda i: DISTANCES_PARIS[i]
-)
-_heures = np.arange(24, dtype=np.float32)
-_CYCL = np.stack([
-    np.sin(2 * np.pi * _heures / 24),
-    np.cos(2 * np.pi * _heures / 24)
-], axis=1).flatten()
+DIST = np.array([431, 830, 502, 264, 1027, 469, 781, 411, 440, 479,
+                 403, 344, 570, 661, 640, 685, 0,   373, 500, 580], dtype=np.float32)
+NEARBY = np.where((DIST > 0) & (DIST < 500))[0]
+_w     = 1.0 / (1.0 + DIST / float(np.median(DIST[DIST > 0])))
+_w[PARIS] = 0.0
+W_GEO  = (_w / _w.sum()).astype(np.float32)
+DIST2  = (DIST ** 2 + 1e-8).astype(np.float32)
 
-GRID = {
-    "boosting_type"    : ["dart", "gbdt", "goss"],
-    "objective"        : ["huber", "regression_l1"],
-    "num_leaves"       : [31, 63, 127],
-    "learning_rate"    : [0.03, 0.05],
-    "n_estimators"     : [400],
-    "colsample_bytree" : [0.6, 0.8],
-    "reg_alpha"        : [0.1, 0.5],
-    "reg_lambda"       : [1.0, 2.0],
-    "min_child_samples": [8, 15],
-}
-
-FIXED_PARAMS = {
-    "min_child_weight": 1e-4,
-    "n_jobs"          : -1,
-    "random_state"    : 42,
-    "verbosity"       : -1,
-}
-
-CONDITIONAL = {
-    "dart": {"drop_rate": [0.08, 0.12], "skip_drop": [0.45], "max_drop": [50], "subsample": [0.75], "subsample_freq": [1]},
-    "gbdt": {"subsample": [0.8], "subsample_freq": [1]},
-    "goss": {"top_rate": [0.2], "other_rate": [0.1]},
-}
-
-OBJECTIVE_EXTRA = {
-    "huber"  : {"alpha": [0.85, 0.9]},
-    "tweedie": {"tweedie_variance_power": [1.8]},
-}
-
-TARGET_GRID = {
-    "temp": {"objective": ["regression_l1", "huber"],  "boosting_type": ["dart", "gbdt"]},
-    "wind": {"objective": ["huber"],                   "boosting_type": ["dart", "gbdt", "goss"]},
-    "rain": {"objective": ["huber", "regression_l1"],  "boosting_type": ["gbdt", "goss"]},
-}
-
-N_SPLITS   = 3
-EARLY_STOP = 30
-MAX_COMBOS = 30
+_coords = np.array([
+    [52.37, 4.90], [41.39, 2.17], [52.49, -1.90], [50.85, 4.35],
+    [55.68,12.57], [51.51, 7.47], [53.35, -6.26], [51.23, 6.78],
+    [51.46, 7.01], [50.11, 8.68], [50.94, 6.96],  [51.51,-0.13],
+    [53.48,-2.24], [43.30, 5.37], [45.46, 9.19],  [48.14,11.58],
+    [48.85, 2.35], [51.92, 4.48], [48.78, 9.18],  [45.07, 7.69]
+], dtype=np.float32)
+_dx   = 2.35 - _coords[:, 1]
+_dy   = 48.85 - _coords[:, 0]
+_n    = np.sqrt(_dx**2 + _dy**2) + 1e-8
+DIR_X = (_dx / _n).astype(np.float32)
+DIR_Y = (_dy / _n).astype(np.float32)
 
 
-def _features(X):
-    paris = X[PARIS_IDX]
-    last  = paris[-1]
-    diff1  = paris[-1] - paris[-2]
-    diff6  = paris[-1] - paris[-7]
-    diff12 = paris[-1] - paris[-13]
-    mean24 = paris.mean(0)
-    std24  = paris.std(0)
-    voisins = []
-    for idx in VOISINS_TRIES[:5]:
-        poids = float(POIDS_GEO[idx])
-        v = X[idx]
-        voisins.append(v[-1] * poids)
-        voisins.append((last - v[-1]) * poids)
-    return np.concatenate([last, diff1, diff6, diff12, mean24, std24, _CYCL, *voisins]).astype(np.float32)
+# ── Data Loading ───────────────────────────────────────────────────────────────
+def load_years(years: list) -> pd.DataFrame:
+    """Charge et concatène les CSV weather_YYYY.csv"""
+    dfs = []
+    for y in years:
+        path = os.path.join(DATA_DIR, f"weather_{y}.csv")
+        print(f"  Chargement {path}...")
+        df = pd.read_csv(path, parse_dates=["timestamp"])
+        df = df[df["city_name"].isin(CITIES)]   # garde uniquement les 20 villes
+        dfs.append(df)
+        print(f"    ✓ {y} — {len(df):,} lignes | {df['city_name'].nunique()} villes")
+    return pd.concat(dfs, ignore_index=True)
 
 
-def load_data():
-    print("Chargement des données...")
-    csv_files = sorted([f for f in os.listdir(DATA_DIR) if f.endswith(".csv") and "weather" in f.lower()])
-    if not csv_files:
-        raise FileNotFoundError(f"Aucun CSV dans {DATA_DIR}")
+def build_dataset(df: pd.DataFrame) -> tuple:
+    """
+    Construit X (N, 20, 24, 8) et y (N, 3) depuis le DataFrame.
+    y = [temperature, wind_speed, rain] à T+HORIZON
+    """
+    # Pivot : index=timestamp, columns=(feature, city)
+    pivot = df.pivot_table(
+        index="timestamp",
+        columns="city_name",
+        values=FEAT_COLS
+    ).sort_index()
 
-    frames = []
-    for f in csv_files:
-        df = pd.read_csv(os.path.join(DATA_DIR, f), parse_dates=["timestamp"])
-        frames.append(df)
-        print(f"  chargé {f} ({len(df):,} lignes)")
+    # Remplissage des NaN
+    pivot = pivot.ffill().bfill()
 
-    data = pd.concat(frames, ignore_index=True)
-    data.sort_values("timestamp", inplace=True)
-    data.reset_index(drop=True, inplace=True)
-    data["city_name"] = data["city_name"].str.strip()
-    data = data[data["city_name"].isin(CITIES_ORDER)].copy()
+    timestamps = pivot.index
+    T = len(timestamps)
+    print(f"  {T:,} timesteps disponibles")
 
-    for col in feat_map:
-        if col in data.columns:
-            data[col] = data[col].fillna(0.0)
-
-    timestamps   = np.sort(data["timestamp"].unique())
-    ts_idx_map   = {t: i for i, t in enumerate(timestamps)}
-    city_idx_map = {c: i for i, c in enumerate(CITIES_ORDER)}
-    data["_ts_idx"]   = data["timestamp"].map(ts_idx_map)
-    data["_city_idx"] = data["city_name"].map(city_idx_map)
-
-    n_ts   = len(timestamps)
-    n_city = len(CITIES_ORDER)
-    cube   = np.zeros((n_ts, n_city, N_FEATURES), dtype=np.float32)
-
-    for _, row in data.iterrows():
-        ci = row.get("_city_idx")
-        ti = row.get("_ts_idx")
-        if pd.isna(ci) or pd.isna(ti):
-            continue
-        ci, ti = int(ci), int(ti)
-        for fname, fidx in feat_map.items():
-            if fname in data.columns:
-                cube[ti, ci, fidx] = row[fname]
-
-    WINDOW  = 24
-    end_idx = n_ts - 6
     X_list, y_list = [], []
+    skipped = 0
 
-    print("Construction des fenêtres...")
-    for i in range(WINDOW, end_idx):
-        window = cube[i - WINDOW:i].transpose(1, 0, 2)
-        target = cube[i, PARIS_IDX, :]
-        X_list.append(window)
-        y_list.append([target[0], target[2], target[1]])
-
-    X = np.array(X_list, dtype=np.float32)
-    y = np.array(y_list, dtype=np.float32)
-    print(f"Dataset : {len(X):,} samples  shape={X.shape}")
-    return X, y
-
-
-def build_features(X):
-    print("Calcul des features delta...")
-    F = np.array([_features(x) for x in X])
-    print(f"Features shape : {F.shape}")
-    return F
-
-
-def build_deltas(X, y):
-    last_paris = X[:, PARIS_IDX, -1, :]
-    return {
-        "temp": y[:, 0] - last_paris[:, 0],
-        "wind": y[:, 1] - last_paris[:, 2],
-        "rain": y[:, 2] - last_paris[:, 1],
-    }
-
-
-def build_combos(target_name):
-    g = {k: v for k, v in GRID.items()}
-    tg = TARGET_GRID[target_name]
-    g["boosting_type"] = tg["boosting_type"]
-    g["objective"]     = tg["objective"]
-
-    base_keys   = list(g.keys())
-    base_combos = list(itertools.product(*g.values()))
-    all_combos  = []
-
-    for base in base_combos:
-        bd  = dict(zip(base_keys, base))
-        bt  = bd["boosting_type"]
-        obj = bd["objective"]
-
-        cb = CONDITIONAL.get(bt, {})
-        cb_combos = [dict(zip(cb.keys(), v)) for v in itertools.product(*cb.values())] if cb else [{}]
-        co = OBJECTIVE_EXTRA.get(obj, {})
-        co_combos = [dict(zip(co.keys(), v)) for v in itertools.product(*co.values())] if co else [{}]
-
-        for c1 in cb_combos:
-            for c2 in co_combos:
-                all_combos.append({**bd, **c1, **c2, **FIXED_PARAMS})
-
-    rng = np.random.default_rng(42)
-    if len(all_combos) > MAX_COMBOS:
-        idx = rng.choice(len(all_combos), MAX_COMBOS, replace=False)
-        all_combos = [all_combos[i] for i in sorted(idx)]
-
-    return all_combos
-
-
-def evaluate_combo(params, F, delta):
-    import lightgbm as lgb
-    kf   = KFold(n_splits=N_SPLITS, shuffle=True, random_state=42)
-    maes = []
-    for fold, (tr, val) in enumerate(kf.split(F), 1):
+    for t in range(23, T - HORIZON):
         try:
-            m = lgb.LGBMRegressor(**params)
-            m.fit(
-                F[tr], delta[tr],
-                eval_set=[(F[val], delta[val])],
-                callbacks=[lgb.early_stopping(EARLY_STOP, verbose=False), lgb.log_evaluation(-1)],
-            )
-            preds = m.predict(F[val])
-            mae   = mean_absolute_error(delta[val], preds)
-            maes.append(mae)
-            print(f"    fold {fold}/{N_SPLITS}  MAE={mae:.4f}")
-        except Exception as e:
-            print(f"    fold {fold} erreur : {e}")
-            return float("inf")
-    return float(np.mean(maes))
+            # ── X : fenêtre 24h ────────────────────────────────────────────
+            X = np.zeros((20, 24, 8), dtype=np.float32)
+            for ci, city in enumerate(CITIES):
+                for fi, feat in enumerate(FEAT_COLS):
+                    try:
+                        vals = pivot[(feat, city)].iloc[t-23:t+1].values
+                        if len(vals) == 24:
+                            X[ci, :, fi] = vals
+                    except KeyError:
+                        pass
+
+            # ── y : Paris à T+HORIZON ──────────────────────────────────────
+            y = np.array([
+                float(pivot[("temperature",  "Paris")].iloc[t + HORIZON]),
+                float(pivot[("wind_speed",   "Paris")].iloc[t + HORIZON]),
+                float(pivot[("rain",         "Paris")].iloc[t + HORIZON]),
+            ], dtype=np.float32)
+
+            # Filtre NaN
+            if np.isnan(X).mean() > 0.05 or np.isnan(y).any():
+                skipped += 1
+                continue
+
+            X_list.append(X)
+            y_list.append(y)
+
+        except Exception:
+            skipped += 1
+
+    print(f"  {len(X_list):,} samples valides | {skipped} ignorés")
+    return np.array(X_list, dtype=np.float32), np.array(y_list, dtype=np.float32)
 
 
-def run_grid(target_name, F, delta):
-    import lightgbm as lgb
-    print(f"\n{'='*50}")
-    print(f"  GRID SEARCH : {target_name.upper()}")
-    print(f"{'='*50}")
+# ── Feature Engineering ────────────────────────────────────────────────────────
+def build_features(X: np.ndarray) -> np.ndarray:
+    """X : (N, 20, 24, 8) → (N, D) float32"""
+    N     = X.shape[0]
+    paris = X[:, PARIS]
+    last  = paris[:, -1]
+    f     = []
 
-    combos = build_combos(target_name)
-    print(f"  {len(combos)} combinaisons à tester")
+    # Valeurs courantes
+    f.append(last)
 
-    results = []
-    best_mae, best_params = float("inf"), None
+    # Stats fenêtrées
+    for fi in [F_TEMP, F_WIND, F_RAIN, F_HUM, F_CLOUD]:
+        for w in [3, 6, 12, 24]:
+            c = paris[:, -w:, fi]
+            f += [c.mean(1, keepdims=True), c.std(1, keepdims=True)]
 
-    for i, params in enumerate(combos, 1):
-        t0 = time.time()
-        print(f"\ncombo {i}/{len(combos)}  bt={params['boosting_type']}  obj={params['objective']}  leaves={params['num_leaves']}  lr={params['learning_rate']}")
-        mae = evaluate_combo(params, F, delta)
-        elapsed = time.time() - t0
-        print(f"  => MAE={mae:.4f}  ({elapsed:.1f}s)")
+    # Lags
+    for fi in [F_TEMP, F_WIND, F_HUM]:
+        for lag in [1, 2, 3, 6, 12, 23]:
+            f.append((last[:, fi] - paris[:, -(1+lag), fi]).reshape(-1, 1))
 
-        results.append((f"test{i}", mae, params))
+    # Heure cyclique
+    f += [np.full((N, 1), np.sin(2*np.pi*23/24), dtype=np.float32),
+          np.full((N, 1), np.cos(2*np.pi*23/24), dtype=np.float32)]
+
+    # Voisins pondérés
+    all_last = X[:, :, -1, :]
+    for fi in [F_TEMP, F_WIND, F_RAIN, F_HUM]:
+        wm = (all_last[:, :, fi] * W_GEO[None, :]).sum(1, keepdims=True)
+        f += [wm, last[:, fi:fi+1] - wm]
+
+    # U, V vent Paris
+    wr  = np.deg2rad(paris[:, :, F_WDIR])
+    ws  = paris[:, :, F_WIND]
+    u_p = ws * np.sin(wr)
+    v_p = ws * np.cos(wr)
+    f  += [u_p[:, -1:], v_p[:, -1:],
+           u_p[:, -6:].mean(1, keepdims=True),
+           v_p[:, -6:].mean(1, keepdims=True)]
+
+    # Advection
+    wr_all = np.deg2rad(X[:, :, -1, F_WDIR])
+    ws_all = X[:, :, -1, F_WIND]
+    u_all  = ws_all * np.sin(wr_all)
+    v_all  = ws_all * np.cos(wr_all)
+    adv    = u_all * DIR_X[None, :] + v_all * DIR_Y[None, :]
+    adv_n  = adv[:, NEARBY]
+    t_all  = X[:, :, -1, F_TEMP]
+    w_all  = X[:, :, -1, F_WIND]
+    r_all  = X[:, :, -1, F_RAIN]
+    f.append((adv_n * (t_all[:, NEARBY] - t_all[:, PARIS:PARIS+1])).sum(1, keepdims=True))
+    f.append((adv_n * (w_all[:, NEARBY] - w_all[:, PARIS:PARIS+1])).sum(1, keepdims=True))
+    f.append((adv_n * r_all[:, NEARBY]).sum(1, keepdims=True))
+
+    # Accélération
+    f.append((paris[:, -1, F_WIND] - 2*paris[:, -2, F_WIND] + paris[:, -3, F_WIND]).reshape(-1, 1))
+    f.append((paris[:, -1, F_TEMP] - 2*paris[:, -2, F_TEMP] + paris[:, -3, F_TEMP]).reshape(-1, 1))
+
+    # Laplacien
+    for fi in [F_TEMP, F_HUM, F_WIND]:
+        lap = ((all_last[:, NEARBY, fi] - all_last[:, PARIS:PARIS+1, fi]) / DIST2[None, NEARBY]).mean(1, keepdims=True)
+        f.append(lap)
+
+    # Convergence
+    f.append((adv_n / (DIST[NEARBY][None, :] + 1e-8)).sum(1, keepdims=True))
+    wsin = np.sin(wr_all[:, NEARBY])
+    wcos = np.cos(wr_all[:, NEARBY])
+    Rbar = np.sqrt(wsin.mean(1)**2 + wcos.mean(1)**2)
+    f.append((1.0 - Rbar).reshape(-1, 1))
+
+    # Frontal detector
+    for fi in [F_TEMP, F_HUM]:
+        spat = all_last[:, NEARBY, fi].std(1)
+        tend = np.abs(paris[:, -1, fi] - paris[:, -7, fi])
+        f.append((spat * tend).reshape(-1, 1))
+
+    # Pentes linéaires
+    for fi in [F_TEMP, F_WIND, F_HUM]:
+        for w in [6, 12, 24]:
+            c   = paris[:, -w:, fi]
+            t   = np.arange(w, dtype=np.float32)
+            tm  = t.mean()
+            num = ((c - c.mean(1, keepdims=True)) * (t - tm)[None, :]).sum(1)
+            den = float(((t - tm)**2).sum()) + 1e-8
+            f.append((num / den).reshape(-1, 1))
+
+    out = np.hstack(f)
+    return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+
+# ── Optuna ─────────────────────────────────────────────────────────────────────
+def optimize(name: str, Ft, yt, Fv, yv, n_trials: int) -> tuple:
+    """Optimise LightGBM pour une variable. Retourne (best_params, history)."""
+
+    history  = []
+    best_mae = float("inf")
+    best_mdl = [None]
+
+    def objective(trial):
+        nonlocal best_mae
+
+        boosting = trial.suggest_categorical("boosting_type", ["dart", "gbdt"])
+        obj_choices = (["tweedie", "regression_l1"] if name == "rain"
+                       else ["regression_l1", "huber"])
+
+        params = dict(
+            boosting_type    = boosting,
+            objective        = trial.suggest_categorical("objective", obj_choices),
+            num_leaves       = trial.suggest_int("num_leaves", 15, 255),
+            learning_rate    = trial.suggest_float("learning_rate", 0.005, 0.15, log=True),
+            n_estimators     = trial.suggest_int("n_estimators", 200, 2000),
+            subsample        = trial.suggest_float("subsample", 0.5, 1.0),
+            subsample_freq   = 1,
+            colsample_bytree = trial.suggest_float("colsample_bytree", 0.4, 1.0),
+            reg_alpha        = trial.suggest_float("reg_alpha", 1e-3, 2.0, log=True),
+            reg_lambda       = trial.suggest_float("reg_lambda", 1e-3, 5.0, log=True),
+            min_child_samples= trial.suggest_int("min_child_samples", 5, 50),
+            n_jobs=-1, random_state=42, verbosity=-1,
+        )
+
+        if boosting == "dart":
+            params["drop_rate"] = trial.suggest_float("drop_rate", 0.01, 0.3)
+            params["skip_drop"] = trial.suggest_float("skip_drop", 0.1, 0.7)
+        if params["objective"] == "huber":
+            params["alpha"] = trial.suggest_float("alpha", 0.6, 0.99)
+        if params["objective"] == "tweedie":
+            params["tweedie_variance_power"] = trial.suggest_float("tweedie_vp", 1.0, 1.99)
+
+        model = lgb.LGBMRegressor(**params)
+        model.fit(Ft, yt)
+        pred = np.maximum(0, model.predict(Fv)) if name in ["wind", "rain"] else model.predict(Fv)
+        mae  = float(mean_absolute_error(yv, pred))
+        history.append(mae)
 
         if mae < best_mae:
-            best_mae    = mae
-            best_params = params.copy()
-            print(f"  NOUVEAU MEILLEUR {best_mae:.4f}")
+            best_mae     = mae
+            best_mdl[0]  = model
+            print(f"    [{name}] #{len(history):3d} — MAE {mae:.4f} ✅")
 
-    return results, best_params, best_mae
+        return mae
+
+    print(f"\n[Optuna] {name} — {n_trials} essais...")
+    study = optuna.create_study(
+        direction="minimize",
+        sampler=optuna.samplers.TPESampler(seed=42),
+    )
+    study.optimize(objective, n_trials=n_trials)
+    print(f"  → Best MAE : {best_mae:.4f}")
+    return study.best_params, history, best_mdl[0]
 
 
-def plot_results(all_results):
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    targets   = ["temp", "wind", "rain"]
-    titles    = ["Température", "Vent", "Pluie"]
-    palette   = ["#2196F3", "#4CAF50", "#F44336"]
+# ── Plots ──────────────────────────────────────────────────────────────────────
+def plot_histories(histories: dict):
+    sns.set_theme(style="darkgrid", palette="muted", font_scale=1.1)
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
-    for ax, target, title, color in zip(axes, targets, titles, palette):
-        res   = all_results[target]
-        names = [r[0] for r in res]
-        maes  = [abs(r[1]) for r in res]
-        best  = min(maes)
+    cfg = {
+        "temp": ("Température", "#E74C3C", "°C"),
+        "wind": ("Vent",        "#3498DB", "km/h"),
+        "rain": ("Pluie",       "#2ECC71", "mm"),
+    }
 
-        colors = [color if m == best else "#BDBDBD" for m in maes]
+    for ax, (name, hist) in zip(axes, histories.items()):
+        title, color, unit = cfg[name]
+        x    = np.arange(1, len(hist)+1)
+        best = np.minimum.accumulate(hist)
+        best_idx = int(np.argmin(hist))
 
-        sns.barplot(x=names, y=maes, palette=colors, ax=ax, edgecolor="white", linewidth=0.5)
+        sns.lineplot(x=x, y=hist,  ax=ax, color=color, alpha=0.35,
+                     linewidth=1.2, label="MAE essai")
+        sns.lineplot(x=x, y=best,  ax=ax, color=color,
+                     linewidth=2.5, label="Meilleur cumulatif")
+        ax.scatter(best_idx+1, hist[best_idx], color=color,
+                   s=130, zorder=5, label=f"Best={hist[best_idx]:.4f}")
+        ax.axhline(hist[best_idx], color=color, linestyle="--", alpha=0.4)
 
-        ax.axhline(best, color=color, linestyle="--", linewidth=1.2, alpha=0.7, label=f"Best={best:.4f}")
-        ax.set_title(f"{title}", fontsize=14, fontweight="bold", pad=10)
-        ax.set_xlabel("Combinaison", fontsize=10)
-        ax.set_ylabel("MAE absolue", fontsize=10)
-        ax.tick_params(axis="x", rotation=90, labelsize=6)
+        ax.set_title(f"{title} ({unit})", fontweight="bold", pad=10)
+        ax.set_xlabel("Essai Optuna")
+        ax.set_ylabel(f"MAE ({unit})")
         ax.legend(fontsize=9)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        ax.set_facecolor("#FAFAFA")
 
-    plt.suptitle("Grid Search — MAE par combinaison", fontsize=16, fontweight="bold", y=1.02)
+    plt.suptitle("Optimisation Optuna — Évolution MAE par variable",
+                 fontsize=14, fontweight="bold", y=1.02)
     plt.tight_layout()
-    out_fig = r"C:\Users\Massy\Documents\ProjetAi\grid_search_results.png"
-    plt.savefig(out_fig, dpi=150, bbox_inches="tight")
-    print(f"\nGraphe sauvegardé -> {out_fig}")
+    out = os.path.join(OUTPUT_DIR, "optuna_history.png")
+    plt.savefig(out, dpi=150, bbox_inches="tight")
     plt.show()
+    print(f"\n[Plot] → {out}")
 
 
-def save_best(all_best, output_path):
-    lines = ["=" * 60, "MEILLEURS PARAMS PAR TARGET", "=" * 60]
-    for target, (params, mae) in all_best.items():
-        lines.append(f"\n{target.upper()}  MAE={mae:.4f}")
-        for k, v in params.items():
-            if k not in {"n_jobs", "random_state", "verbosity", "min_child_weight"}:
-                val_str = f'"{v}"' if isinstance(v, str) else str(v)
-                lines.append(f"  {k} = {val_str}")
-    text = "\n".join(lines)
-    print("\n" + text)
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(text)
-    print(f"\nSauvegardé -> {output_path}")
-
-
+# ── Main ───────────────────────────────────────────────────────────────────────
 def main():
-    try:
-        import lightgbm as lgb
-    except (ImportError, OSError):
-        print("LightGBM non disponible, arrêt.")
-        return
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    t0 = time.time()
+    # 1. Chargement
+    print("\n" + "="*55)
+    print("  ÉTAPE 1 — Chargement des données")
+    print("="*55)
+    print("\n[Train] 2020 → 2025...")
+    df_train = load_years(range(2020, 2026))
+    print("\n[Val]   2026...")
+    # Cherche weather_2026.csv sinon ignore
+    val_path = os.path.join(DATA_DIR, "weather_2026.csv")
+    if os.path.exists(val_path):
+        df_val = pd.read_csv(val_path, parse_dates=["timestamp"])
+        df_val = df_val[df_val["city_name"].isin(CITIES)]
+        print(f"  ✓ 2026 — {len(df_val):,} lignes")
+    else:
+        # Utilise les 20% derniers de 2025 comme validation
+        print("  ⚠ weather_2026.csv introuvable — utilise les 20% derniers de 2025")
+        cut = int(len(df_train) * 0.8)
+        df_val   = df_train.iloc[cut:].copy()
+        df_train = df_train.iloc[:cut].copy()
 
-    X, y    = load_data()
-    F       = build_features(X)
-    deltas  = build_deltas(X, y)
+    # 2. Build datasets
+    print("\n" + "="*55)
+    print("  ÉTAPE 2 — Construction des datasets")
+    print("="*55)
+    print("\n[Train]")
+    X_train, y_train = build_dataset(df_train)
+    print("\n[Val]")
+    X_val,   y_val   = build_dataset(df_val)
 
-    all_results = {}
-    all_best    = {}
+    # 3. Features
+    print("\n" + "="*55)
+    print("  ÉTAPE 3 — Feature Engineering")
+    print("="*55)
+    print("  Construction features train...")
+    F_train = build_features(X_train)
+    print(f"  → {F_train.shape[1]} features | {F_train.shape[0]} samples")
+    print("  Construction features val...")
+    F_val   = build_features(X_val)
 
-    for target in ["temp", "wind", "rain"]:
-        results, best_params, best_mae = run_grid(target, F, deltas[target])
-        all_results[target] = results
-        all_best[target]    = (best_params, best_mae)
-        print(f"\n{target.upper()} terminé — best MAE={best_mae:.4f}")
+    # Targets
+    last_tr = X_train[:, PARIS, -1, :]
+    last_vl = X_val[:,   PARIS, -1, :]
 
-    print(f"\nDurée totale : {(time.time()-t0)/60:.1f} min")
+    dt_temp = y_train[:, 0] - last_tr[:, F_TEMP]   # ΔT
+    dt_wind = y_train[:, 1] - last_tr[:, F_WIND]   # ΔW
+    rain_tr = y_train[:, 2]
 
-    save_best(all_best, OUTPUT_TXT)
-    plot_results(all_results)
+    dv_temp = y_val[:, 0] - last_vl[:, F_TEMP]
+    dv_wind = y_val[:, 1] - last_vl[:, F_WIND]
+    rain_vl = y_val[:, 2]
+
+    wet_tr  = rain_tr > 0.05
+    wet_vl  = rain_vl > 0.05
+
+    # 4. Optuna
+    print("\n" + "="*55)
+    print("  ÉTAPE 4 — Optimisation Optuna")
+    print("="*55)
+
+    histories = {}
+
+    bp_temp, hist_temp, mdl_temp = optimize(
+        "temp", F_train, dt_temp, F_val, dv_temp, N_TRIALS)
+    histories["temp"] = hist_temp
+
+    bp_wind, hist_wind, mdl_wind = optimize(
+        "wind", F_train, dt_wind, F_val, dv_wind, N_TRIALS)
+    histories["wind"] = hist_wind
+
+    bp_rain, hist_rain, mdl_rain = optimize(
+        "rain",
+        F_train[wet_tr], rain_tr[wet_tr],
+        F_val[wet_vl],   rain_vl[wet_vl],
+        N_TRIALS,
+    )
+    histories["rain"] = hist_rain
+
+    # 5. Graphes
+    print("\n" + "="*55)
+    print("  ÉTAPE 5 — Graphes Optuna")
+    print("="*55)
+    plot_histories(histories)
+
+    # 6. Modèles finaux
+    print("\n" + "="*55)
+    print("  ÉTAPE 6 — Entraînement final + sauvegarde")
+    print("="*55)
+
+    print("  → Température...")
+    m_temp = lgb.LGBMRegressor(**bp_temp)
+    m_temp.fit(F_train, dt_temp)
+    pickle.dump(m_temp, open(os.path.join(OUTPUT_DIR, "model_temp.pkl"), "wb"))
+    print("    ✓ model_temp.pkl")
+
+    print("  → Vent...")
+    m_wind = lgb.LGBMRegressor(**bp_wind)
+    m_wind.fit(F_train, dt_wind)
+    pickle.dump(m_wind, open(os.path.join(OUTPUT_DIR, "model_wind.pkl"), "wb"))
+    print("    ✓ model_wind.pkl")
+
+    print("  → Pluie classifier...")
+    clf = LogisticRegression(C=1.0, max_iter=500)
+    clf.fit(F_train, wet_tr.astype(int))
+    pickle.dump(clf, open(os.path.join(OUTPUT_DIR, "rain_clf.pkl"), "wb"))
+    print("    ✓ rain_clf.pkl")
+
+    print("  → Pluie regressor...")
+    m_rain = lgb.LGBMRegressor(**bp_rain)
+    m_rain.fit(F_train[wet_tr], rain_tr[wet_tr])
+    pickle.dump(m_rain, open(os.path.join(OUTPUT_DIR, "model_rain.pkl"), "wb"))
+    print("    ✓ model_rain.pkl")
+
+    # 7. Évaluation finale
+    print("\n" + "="*55)
+    print("  ÉTAPE 7 — Évaluation sur 2026")
+    print("="*55)
+
+    pred_temp = last_vl[:, F_TEMP] + m_temp.predict(F_val)
+    pred_wind = np.maximum(0, last_vl[:, F_WIND] + m_wind.predict(F_val))
+    p_rain    = clf.predict_proba(F_val)[:, 1]
+    pred_rain = np.maximum(0, p_rain * m_rain.predict(F_val))
+
+    mae_t = mean_absolute_error(y_val[:, 0], pred_temp)
+    mae_w = mean_absolute_error(y_val[:, 1], pred_wind)
+    mae_r = mean_absolute_error(y_val[:, 2], pred_rain)
+    score = -(mae_t/7.49 + mae_w/5.05 + mae_r/0.40) / 3
+
+    print(f"\n  MAE Température : {mae_t:.4f} °C")
+    print(f"  MAE Vent        : {mae_w:.4f} km/h")
+    print(f"  MAE Pluie       : {mae_r:.4f} mm")
+    print(f"\n  Score ML Arena  : {score:.4f}")
+    print("\n✅ Terminé !")
 
 
 if __name__ == "__main__":
