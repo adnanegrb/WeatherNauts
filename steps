@@ -1,0 +1,69 @@
+1. COLLECT RAW DATA
+   Download weather CSV files for each year from 2020 to 2026.
+   Each file contains hourly meteorological observations for hundreds of European cities.
+   Variables available : temperature, rain, wind speed, wind direction, humidity, clouds, snow, visibility.
+
+2. DATA CLEANING
+   Filter the dataset to keep only the 20 cities required by the competition.
+   Set the visibility column to 0 — it is 100% NaN and useless for the model.
+   Parse timestamps to UTC and sort by city and time.
+   Remove duplicate rows on the (city_name, timestamp) key.
+   Apply physical clipping based on real European weather records (WMO, Météo-France, Copernicus) :
+   temperature in [-45, 50], wind in [0, 75], rain in [0, 200], humidity in [0, 100].
+   Impute remaining NaN values per city using a cascade strategy :
+   linear interpolation for internal gaps, forward fill for trailing gaps, backward fill for leading gaps,
+   and global median as a last resort.
+   Extract hour and month from the timestamp for seasonal features.
+   Export one clean CSV file per year : weather_{year}_clean.csv.
+
+3. FEATURE ENGINEERING
+   Build a structured feature vector phi(X) of dimension 98 from the raw tensor X of shape (20, 24, 8).
+
+   Block 1 — Current values : extract the last observed state of Paris across all 8 variables.
+   Block 2 — Windowed statistics : compute mean and std over 6h and 24h windows for temperature, wind, rain, humidity and clouds.
+   Block 3 — Temporal lags : compute differences between current and past values at lags 1, 2, 3, 6, 12 and 23 hours.
+   Block 4 — Geographic weighting : weight neighboring cities by inverse distance w_i = 1 / (1 + d_i / median(d)).
+              Compute weighted averages and spread between Paris and its neighbors.
+   Block 5 — Wind decomposition : convert wind speed and direction into cartesian components u = W sin(theta), v = W cos(theta).
+   Block 6 — Thermal advection : project neighbor wind vectors onto the direction toward Paris and weight by temperature difference.
+   Block 7 — Wind acceleration : compute discrete second derivative of wind speed to capture inertia.
+   Block 8 — Spatial Laplacian : approximate thermal diffusion using (T_neighbor - T_Paris) / distance^2.
+   Block 9 — Wind convergence : measure directional coherence of neighboring winds using circular mean resultant length.
+
+4. DELTA DECOMPOSITION
+   Instead of predicting the absolute future value y_{t+6} directly,
+   train the model to predict the variation delta_y = y_{t+6} - y_t.
+   Reconstruct the final prediction as y_hat = y_t + delta_y_hat.
+   This reduces target variance since sigma_delta^2 = 2 * sigma_y^2 * (1 - rho_6) << sigma_y^2,
+   which improves convergence and signal-to-noise ratio.
+   Rain is predicted directly (not as a delta) because its distribution is zero-inflated
+   and the delta is not informative.
+
+5. MODEL TRAINING
+   Train three independent HistGradientBoostingRegressor models, one per target variable.
+   Temperature and wind use Huber or absolute error loss, robust to meteorological outliers.
+   Rain uses absolute error loss adapted to its zero-inflated distribution.
+   Training data : 2020–2025 (approximately 52,000 samples).
+   Validation data : 2026 (approximately 8,000 samples), strictly separated in time to avoid data leakage.
+
+6. HYPERPARAMETER OPTIMIZATION WITH OPTUNA
+   Use Optuna with the TPE (Tree-structured Parzen Estimator) sampler to search the hyperparameter space.
+   Parameters explored : loss function, learning rate, max iterations, max leaf nodes, min samples per leaf, L2 regularization, max bins.
+   Each trial is evaluated on the 2026 validation set using mean absolute error.
+   Run 50 to 100 trials per model to find the optimal configuration.
+
+7. FINAL RETRAINING
+   Once the best hyperparameters are identified, retrain each model on the full dataset 2020–2026.
+   This enriches the training set with the most recent data before deployment.
+
+8. MODEL EXPORT
+   Serialize the three trained models using pickle :
+   model_temp.pkl, model_wind.pkl, model_rain.pkl.
+   These files are uploaded directly to ML Arena alongside agent.py.
+
+9. AGENT DEPLOYMENT
+   The agent loads the three pkl files at initialization.
+   At each prediction step, it builds the 98-dimensional feature vector from the input tensor X,
+   runs the three models to predict the deltas,
+   reconstructs the absolute values and clips wind and rain to be non-negative.
+   Final score achieved on ML Arena : L = -0.28, competitive at leaderboard level.
