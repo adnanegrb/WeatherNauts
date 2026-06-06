@@ -3,7 +3,6 @@
 ![Python](https://img.shields.io/badge/Python-3.10-blue?style=flat-square&logo=python)
 ![Model](https://img.shields.io/badge/Model-HistGradientBoosting-8A2BE2?style=flat-square)
 ![Optimizer](https://img.shields.io/badge/Optimizer-Optuna%20TPE-orange?style=flat-square)
-![Score](https://img.shields.io/badge/Score%20L-=-0.11-green?style=flat-square)
 ![Framework](https://img.shields.io/badge/Framework-scikit--learn-red?style=flat-square)
 
 WeatherNauts is a competitive ML agent built for the ML Arena competition. It predicts temperature, wind speed and rainfall for Paris 6 hours ahead, using 24 hours of historical data from 20 European cities.
